@@ -48,7 +48,11 @@ def main():
     
     # Check model
     model = CyberWorldModel(num_features=7, hidden_size=64, num_layers=1)
-    state_dict = torch.load("world_model.pt", map_location="cpu")
+    checkpoint = torch.load("world_model.pt", map_location="cpu")
+    if "model_state_dict" in checkpoint:
+        state_dict = checkpoint["model_state_dict"]
+    else:
+        state_dict = checkpoint
     model.load_state_dict(state_dict)
     model.eval()
     print("\nModel state_dict keys and shapes:")

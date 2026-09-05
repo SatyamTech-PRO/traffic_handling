@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect, useCallback } from 'react';
 import {
   ShieldAlert,
   AlertTriangle,
@@ -13,8 +13,19 @@ import {
   Zap,
   Activity,
   ArrowRight,
+  Sliders,
+  RefreshCw,
 } from 'lucide-react';
 import { DEMO_SCENARIOS, ScenarioKey } from '../data/mockData';
+import {
+  runLiveInference,
+  FEATURE_SPECS,
+  FeatureSpec,
+  FeatureKey,
+  normalizeVector,
+  denormalizeVector,
+  LiveInferenceResult,
+} from '../lib/inferenceEngine';
 
 // ---------------------------------------------------------------------------
 // Plain-Language Feature Translations for Evaluator Clarity
@@ -95,18 +106,62 @@ export const ForecasterSimulator: React.FC = () => {
   const [selectedScenario, setSelectedScenario] = useState<ScenarioKey>('portscan');
   const [isForecasting, setIsForecasting] = useState<boolean>(false);
   const [showRawValues, setShowRawValues] = useState<boolean>(false);
+  const [showSliders, setShowSliders] = useState<boolean>(false);
 
-  // Pull real holdout scenario data
-  const scenarioData = useMemo(() => {
-    return DEMO_SCENARIOS[selectedScenario];
-  }, [selectedScenario]);
+  // Active 5-window sequence (z-scores). Initialized from real holdout data.
+  const [activeHistoryZ, setActiveHistoryZ] = useState<number[][]>(() => {
+    return DEMO_SCENARIOS['portscan'].history.map((row) => [...row]);
+  });
 
-  // Current forecast results from the real data
-  const forecastSteps = scenarioData?.forecast_steps || [];
-  const finalStep = forecastSteps[forecastSteps.length - 1];
-  const finalProb = finalStep?.attack_probability ?? 0;
-  const finalStage = finalStep?.mitre_stage ?? 'Normal';
-  const topShap = scenarioData?.top_shap_features || [];
+  // Flag indicating whether the user manually tweaked any slider
+  const [isCustomTelemetry, setIsCustomTelemetry] = useState<boolean>(false);
+
+  // When scenario changes, populate activeHistoryZ from the real dataset preset
+  const handleSelectScenario = (scenario: ScenarioKey) => {
+    setSelectedScenario(scenario);
+    setIsCustomTelemetry(false);
+    const presetHistory = DEMO_SCENARIOS[scenario].history.map((row) => [...row]);
+    setActiveHistoryZ(presetHistory);
+
+    // Compute live forecast and log raw outputs to console
+    runLiveInference(presetHistory, true);
+  };
+
+  // Raw values of the current window (window index 4, t)
+  const currentRawValues = useMemo(() => {
+    const currentZ = activeHistoryZ[4] || [0, 0, 0, 0, 0, 0, 0];
+    return denormalizeVector(currentZ);
+  }, [activeHistoryZ]);
+
+  // Handle slider changes for individual raw features of window t
+  const handleSliderChange = (featIdx: number, newRawVal: number) => {
+    setIsCustomTelemetry(true);
+    const updatedRaw = [...currentRawValues];
+    updatedRaw[featIdx] = newRawVal;
+    const updatedCurrentZ = normalizeVector(updatedRaw);
+
+    setActiveHistoryZ((prev) => {
+      const newHistory = [...prev.slice(0, 4), updatedCurrentZ];
+      // Run live inference on every tweak
+      runLiveInference(newHistory, true);
+      return newHistory;
+    });
+  };
+
+  // Reset sliders back to scenario preset
+  const handleResetToPreset = () => {
+    handleSelectScenario(selectedScenario);
+  };
+
+  // Compute live forecast results from activeHistoryZ using pure JS inference engine
+  const liveResult: LiveInferenceResult = useMemo(() => {
+    return runLiveInference(activeHistoryZ, false);
+  }, [activeHistoryZ]);
+
+  const forecastSteps = liveResult.forecast_steps;
+  const finalProb = liveResult.final_prob;
+  const finalStage = liveResult.final_stage;
+  const topShap = liveResult.top_shap_features;
 
   // Plain-language factor names for the single-line summary
   const plainFactors = topShap.map(
@@ -116,12 +171,14 @@ export const ForecasterSimulator: React.FC = () => {
   // Dynamic plain-language sentence
   const plainSummarySentence = generatePlainLanguageSummary(finalProb, finalStage, topShap);
 
-  // Trigger brief simulation when user clicks "Run Forecast"
+  // Trigger brief visual feedback and fresh computation when user clicks "Run Forecast"
   const handleRunForecast = () => {
     setIsForecasting(true);
+    // Explicitly run with console logging for evaluator inspection
+    runLiveInference(activeHistoryZ, true);
     setTimeout(() => {
       setIsForecasting(false);
-    }, 280);
+    }, 250);
   };
 
   // Color styles for the large MITRE stage badge
@@ -133,6 +190,12 @@ export const ForecasterSimulator: React.FC = () => {
         return 'bg-red-500/20 text-red-300 border-red-500/40 shadow-red-950/40';
       case 'Initial Access':
         return 'bg-orange-500/20 text-orange-300 border-orange-500/40 shadow-orange-950/40';
+      case 'Exfiltration':
+        return 'bg-purple-500/20 text-purple-300 border-purple-500/40 shadow-purple-950/40';
+      case 'Lateral Movement':
+        return 'bg-blue-500/20 text-blue-300 border-blue-500/40 shadow-blue-950/40';
+      case 'Command & Control':
+        return 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40 shadow-cyan-950/40';
       case 'Normal':
       default:
         return 'bg-emerald-500/20 text-emerald-300 border-emerald-500/40 shadow-emerald-950/40';
@@ -162,13 +225,18 @@ export const ForecasterSimulator: React.FC = () => {
     return 'Critical Risk (Immediate Action)';
   };
 
+  // Provenance text
+  const provenanceText = isCustomTelemetry
+    ? 'Live Synthetic / Novel Network Input Vector (Testing out-of-distribution generalization in client-side PyTorch LSTM engine)'
+    : DEMO_SCENARIOS[selectedScenario]?.data_provenance || 'Holdout set, session never seen during training';
+
   return (
     <div className="space-y-6">
       {/* 1. Header: App title + one-line description */}
       <div className="text-center space-y-2">
         <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-slate-900 border border-slate-800 text-xs text-slate-400 mb-1">
           <Activity className="w-3.5 h-3.5 text-emerald-400" />
-          <span>Closed-Loop PyTorch World Model</span>
+          <span>Client-Side PyTorch World Model Engine</span>
         </div>
         <h1 className="text-2xl sm:text-4xl font-bold tracking-tight text-white">
           Cyber World Model
@@ -178,78 +246,196 @@ export const ForecasterSimulator: React.FC = () => {
         </p>
       </div>
 
-      {/* 2. Control Row: 4 Scenario Buttons + One "Run Forecast" Button */}
+      {/* 2. Control Row: 4 Scenario Buttons + Manual Sliders Toggle + Run Forecast Button */}
       <div className="bg-slate-900/80 border border-slate-800/90 rounded-2xl p-3 sm:p-4 flex flex-col md:flex-row items-center justify-between gap-3 shadow-lg">
         {/* 4 Scenario Buttons */}
         <div className="w-full md:w-auto grid grid-cols-2 sm:grid-cols-4 gap-2">
           <button
             id="scenario-btn-normal"
-            onClick={() => setSelectedScenario('normal')}
+            onClick={() => handleSelectScenario('normal')}
             className={`px-3 py-2 rounded-xl text-xs font-semibold transition-all text-center flex items-center justify-center gap-1.5 ${
-              selectedScenario === 'normal'
+              selectedScenario === 'normal' && !isCustomTelemetry
                 ? 'bg-emerald-500 text-slate-950 shadow-md shadow-emerald-950'
                 : 'bg-slate-950 text-slate-300 border border-slate-800 hover:border-slate-700 hover:text-white'
             }`}
           >
-            <span className={`w-2 h-2 rounded-full ${selectedScenario === 'normal' ? 'bg-slate-950' : 'bg-emerald-400'}`}></span>
+            <span
+              className={`w-2 h-2 rounded-full ${
+                selectedScenario === 'normal' && !isCustomTelemetry
+                  ? 'bg-slate-950'
+                  : 'bg-emerald-400'
+              }`}
+            />
             <span>Normal</span>
           </button>
 
           <button
             id="scenario-btn-portscan"
-            onClick={() => setSelectedScenario('portscan')}
+            onClick={() => handleSelectScenario('portscan')}
             className={`px-3 py-2 rounded-xl text-xs font-semibold transition-all text-center flex items-center justify-center gap-1.5 ${
-              selectedScenario === 'portscan'
+              selectedScenario === 'portscan' && !isCustomTelemetry
                 ? 'bg-yellow-400 text-slate-950 shadow-md shadow-yellow-950'
                 : 'bg-slate-950 text-slate-300 border border-slate-800 hover:border-slate-700 hover:text-white'
             }`}
           >
-            <span className={`w-2 h-2 rounded-full ${selectedScenario === 'portscan' ? 'bg-slate-950' : 'bg-yellow-400'}`}></span>
+            <span
+              className={`w-2 h-2 rounded-full ${
+                selectedScenario === 'portscan' && !isCustomTelemetry
+                  ? 'bg-slate-950'
+                  : 'bg-yellow-400'
+              }`}
+            />
             <span>PortScan</span>
           </button>
 
           <button
             id="scenario-btn-dos"
-            onClick={() => setSelectedScenario('dos')}
+            onClick={() => handleSelectScenario('dos')}
             className={`px-3 py-2 rounded-xl text-xs font-semibold transition-all text-center flex items-center justify-center gap-1.5 ${
-              selectedScenario === 'dos'
+              selectedScenario === 'dos' && !isCustomTelemetry
                 ? 'bg-red-500 text-white shadow-md shadow-red-950'
                 : 'bg-slate-950 text-slate-300 border border-slate-800 hover:border-slate-700 hover:text-white'
             }`}
           >
-            <span className={`w-2 h-2 rounded-full ${selectedScenario === 'dos' ? 'bg-white' : 'bg-red-400'}`}></span>
+            <span
+              className={`w-2 h-2 rounded-full ${
+                selectedScenario === 'dos' && !isCustomTelemetry ? 'bg-white' : 'bg-red-400'
+              }`}
+            />
             <span>DoS / DDoS</span>
           </button>
 
           <button
             id="scenario-btn-ftp"
-            onClick={() => setSelectedScenario('ftp_patator')}
+            onClick={() => handleSelectScenario('ftp_patator')}
             className={`px-3 py-2 rounded-xl text-xs font-semibold transition-all text-center flex items-center justify-center gap-1.5 ${
-              selectedScenario === 'ftp_patator'
+              selectedScenario === 'ftp_patator' && !isCustomTelemetry
                 ? 'bg-orange-500 text-white shadow-md shadow-orange-950'
                 : 'bg-slate-950 text-slate-300 border border-slate-800 hover:border-slate-700 hover:text-white'
             }`}
           >
-            <span className={`w-2 h-2 rounded-full ${selectedScenario === 'ftp_patator' ? 'bg-white' : 'bg-orange-400'}`}></span>
+            <span
+              className={`w-2 h-2 rounded-full ${
+                selectedScenario === 'ftp_patator' && !isCustomTelemetry
+                  ? 'bg-white'
+                  : 'bg-orange-400'
+              }`}
+            />
             <span>FTP-Patator</span>
           </button>
         </div>
 
-        {/* Run Forecast Button */}
-        <button
-          id="run-forecast-primary-btn"
-          onClick={handleRunForecast}
-          disabled={isForecasting}
-          className="w-full md:w-auto px-5 py-2.5 rounded-xl text-xs sm:text-sm font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-all shadow-md shadow-emerald-950 flex items-center justify-center gap-2 shrink-0 active:scale-98"
-        >
-          {isForecasting ? (
-            <Sparkles className="w-4 h-4 animate-spin text-slate-950" />
-          ) : (
-            <Play className="w-4 h-4 fill-current text-slate-950" />
-          )}
-          <span>{isForecasting ? 'Running Forecast...' : 'Run Forecast'}</span>
-        </button>
+        {/* Action Group: Sliders Toggle + Run Forecast Button */}
+        <div className="w-full md:w-auto flex items-center gap-2">
+          {/* Manual Telemetry Slider Toggle Button */}
+          <button
+            id="toggle-sliders-btn"
+            onClick={() => setShowSliders(!showSliders)}
+            className={`px-3 py-2 rounded-xl text-xs font-medium transition-all flex items-center gap-1.5 border ${
+              showSliders || isCustomTelemetry
+                ? 'bg-cyan-500/20 text-cyan-300 border-cyan-500/40'
+                : 'bg-slate-950 text-slate-400 hover:text-slate-200 border-slate-800'
+            }`}
+            title="Adjust raw feature sliders to test arbitrary inputs on the live LSTM"
+          >
+            <Sliders className="w-3.5 h-3.5" />
+            <span>{showSliders ? 'Close Sliders' : 'Manual Sliders (7 Features)'}</span>
+            {isCustomTelemetry && (
+              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-pulse" />
+            )}
+          </button>
+
+          {/* Run Forecast Button */}
+          <button
+            id="run-forecast-primary-btn"
+            onClick={handleRunForecast}
+            disabled={isForecasting}
+            className="flex-1 md:flex-initial px-5 py-2.5 rounded-xl text-xs sm:text-sm font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 transition-all shadow-md shadow-emerald-950 flex items-center justify-center gap-2 shrink-0 active:scale-98"
+          >
+            {isForecasting ? (
+              <Sparkles className="w-4 h-4 animate-spin text-slate-950" />
+            ) : (
+              <Play className="w-4 h-4 fill-current text-slate-950" />
+            )}
+            <span>{isForecasting ? 'Evaluating Live...' : 'Run Forecast'}</span>
+          </button>
+        </div>
       </div>
+
+      {/* Manual / Slider Input Panel (Allows testing arbitrary edge-case or unseen inputs) */}
+      {showSliders && (
+        <div className="bg-slate-900/90 border border-cyan-900/50 rounded-2xl p-4 sm:p-5 space-y-4 shadow-xl">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <Sliders className="w-4 h-4 text-cyan-400" />
+              <span className="text-xs font-bold text-slate-200 uppercase tracking-wider">
+                Live Telemetry Controls (Observation Window t)
+              </span>
+              {isCustomTelemetry && (
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/20 text-cyan-300 border border-cyan-500/30">
+                  Custom Input Active
+                </span>
+              )}
+            </div>
+            {isCustomTelemetry && (
+              <button
+                onClick={handleResetToPreset}
+                className="text-xs text-slate-400 hover:text-white flex items-center gap-1 transition-colors"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                <span>Reset to {selectedScenario}</span>
+              </button>
+            )}
+          </div>
+
+          <p className="text-[11px] text-slate-400">
+            Slide any of the 7 raw network telemetry indicators to evaluate how the model responds
+            to arbitrary or unseen conditions in real time.
+          </p>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
+            {FEATURE_SPECS.map((spec, idx) => {
+              const rawVal = currentRawValues[idx] ?? spec.mean;
+              const zVal = activeHistoryZ[4] ? activeHistoryZ[4][idx] : 0;
+
+              return (
+                <div
+                  key={spec.key}
+                  className="p-3 rounded-xl bg-slate-950/80 border border-slate-800/90 space-y-1.5"
+                >
+                  <div className="flex justify-between items-baseline">
+                    <label className="text-xs font-semibold text-slate-300">
+                      {spec.label}
+                    </label>
+                    <span className="text-xs font-mono font-bold text-cyan-400">
+                      {rawVal.toLocaleString(undefined, { maximumFractionDigits: 1 })}{' '}
+                      <span className="text-[10px] text-slate-500 font-normal">{spec.unit}</span>
+                    </span>
+                  </div>
+
+                  <input
+                    type="range"
+                    min={spec.min}
+                    max={spec.max}
+                    step={spec.step}
+                    value={rawVal}
+                    onChange={(e) => handleSliderChange(idx, parseFloat(e.target.value))}
+                    className="w-full h-1.5 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-cyan-400"
+                  />
+
+                  <div className="flex justify-between text-[10px] text-slate-500 font-mono">
+                    <span>min: {spec.min.toLocaleString()}</span>
+                    <span className="text-slate-400">
+                      z: {zVal >= 0 ? `+${zVal.toFixed(2)}` : zVal.toFixed(2)}σ
+                    </span>
+                    <span>max: {spec.max.toLocaleString()}</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* 3. Compact Historical Input Data */}
       <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl p-4 sm:p-5">
@@ -267,7 +453,7 @@ export const ForecasterSimulator: React.FC = () => {
 
         {/* 5 Simple Compact Cards with Mini Color Strips */}
         <div className="grid grid-cols-5 gap-2 sm:gap-3">
-          {(scenarioData?.history || []).map((stateVec, idx) => {
+          {activeHistoryZ.map((stateVec, idx) => {
             const timeLabels = ['t-40s', 't-30s', 't-20s', 't-10s', 't (current)'];
             const isCurrent = idx === 4;
 
@@ -298,9 +484,11 @@ export const ForecasterSimulator: React.FC = () => {
                   />
                 </div>
 
-                <span className={`text-[11px] sm:text-xs font-mono font-medium block truncate ${
-                  isCurrent ? 'text-emerald-300 font-semibold' : 'text-slate-300'
-                }`}>
+                <span
+                  className={`text-[11px] sm:text-xs font-mono font-medium block truncate ${
+                    isCurrent ? 'text-emerald-300 font-semibold' : 'text-slate-300'
+                  }`}
+                >
                   {timeLabels[idx]}
                 </span>
 
@@ -318,7 +506,11 @@ export const ForecasterSimulator: React.FC = () => {
         {/* Subtle Ambient Glow */}
         <div
           className={`absolute -top-24 -right-24 w-64 h-64 rounded-full blur-3xl opacity-10 pointer-events-none ${
-            finalProb >= 0.6 ? 'bg-red-500' : finalProb >= 0.3 ? 'bg-yellow-500' : 'bg-emerald-500'
+            finalProb >= 0.6
+              ? 'bg-red-500'
+              : finalProb >= 0.3
+              ? 'bg-yellow-500'
+              : 'bg-emerald-500'
           }`}
         />
 
@@ -401,9 +593,18 @@ export const ForecasterSimulator: React.FC = () => {
               {forecastSteps.map((step) => {
                 const stepProb = step.attack_probability;
                 return (
-                  <div key={step.step} className="flex-1 px-1 py-1.5 rounded-lg bg-slate-950 border border-slate-800/80">
-                    <span className="text-[10px] text-slate-400 block font-mono">+{step.step * 10}s</span>
-                    <span className={`text-xs font-bold font-mono block ${getRiskMeterTextColor(stepProb)}`}>
+                  <div
+                    key={step.step}
+                    className="flex-1 px-1 py-1.5 rounded-lg bg-slate-950 border border-slate-800/80"
+                  >
+                    <span className="text-[10px] text-slate-400 block font-mono">
+                      +{step.step * 10}s
+                    </span>
+                    <span
+                      className={`text-xs font-bold font-mono block ${getRiskMeterTextColor(
+                        stepProb
+                      )}`}
+                    >
                       {(stepProb * 100).toFixed(0)}%
                     </span>
                   </div>
@@ -421,7 +622,11 @@ export const ForecasterSimulator: React.FC = () => {
             className="px-4 py-2 rounded-xl text-xs font-medium text-slate-400 hover:text-slate-200 bg-slate-950 hover:bg-slate-900 border border-slate-800 transition-all flex items-center gap-2"
           >
             <span>{showRawValues ? 'Hide raw values' : 'Show raw values'}</span>
-            {showRawValues ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+            {showRawValues ? (
+              <ChevronUp className="w-3.5 h-3.5" />
+            ) : (
+              <ChevronDown className="w-3.5 h-3.5" />
+            )}
           </button>
         </div>
 
@@ -436,7 +641,7 @@ export const ForecasterSimulator: React.FC = () => {
                   Validation Data Provenance
                 </span>
                 <span className="text-slate-400 font-mono text-[11px]">
-                  {scenarioData?.data_provenance}
+                  {provenanceText}
                 </span>
               </div>
             </div>
@@ -447,12 +652,19 @@ export const ForecasterSimulator: React.FC = () => {
                 Exact SHAP Shapley Feature Attributions (Final Step)
               </span>
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                {topShap.map(([featName, val], idx) => (
-                  <div key={idx} className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 font-mono text-[11px]">
+                {topShap.slice(0, 3).map(([featName, val], idx) => (
+                  <div
+                    key={idx}
+                    className="p-2.5 rounded-lg bg-slate-900 border border-slate-800 font-mono text-[11px]"
+                  >
                     <span className="text-slate-400 block text-[10px] truncate">
                       {FEATURE_DISPLAY_LABELS[featName] || featName}
                     </span>
-                    <span className={`font-bold ${val >= 0 ? 'text-red-400' : 'text-emerald-400'}`}>
+                    <span
+                      className={`font-bold ${
+                        val >= 0 ? 'text-red-400' : 'text-emerald-400'
+                      }`}
+                    >
                       {val >= 0 ? `+${val.toFixed(4)}` : val.toFixed(4)}
                     </span>
                     <span className="text-slate-500 text-[10px] ml-1.5">
@@ -483,19 +695,33 @@ export const ForecasterSimulator: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody>
-                    {(scenarioData?.history || []).map((row, idx) => (
-                      <tr key={`h-${idx}`} className="border-b border-slate-900 text-slate-400">
-                        <td className="py-1 px-2 text-slate-300 font-semibold">t-{(4 - idx) * 10}s</td>
+                    {activeHistoryZ.map((row, idx) => (
+                      <tr
+                        key={`h-${idx}`}
+                        className="border-b border-slate-900 text-slate-400"
+                      >
+                        <td className="py-1 px-2 text-slate-300 font-semibold">
+                          t-{(4 - idx) * 10}s
+                        </td>
                         {row.map((val, vIdx) => (
-                          <td key={vIdx} className="py-1 px-2">{val.toFixed(2)}</td>
+                          <td key={vIdx} className="py-1 px-2">
+                            {val.toFixed(2)}
+                          </td>
                         ))}
                       </tr>
                     ))}
                     {forecastSteps.map((step) => (
-                      <tr key={`f-${step.step}`} className="border-b border-slate-900 text-emerald-300 bg-emerald-950/10">
-                        <td className="py-1 px-2 font-semibold">t+{step.step * 10}s (pred)</td>
+                      <tr
+                        key={`f-${step.step}`}
+                        className="border-b border-slate-900 text-emerald-300 bg-emerald-950/10"
+                      >
+                        <td className="py-1 px-2 font-semibold">
+                          t+{step.step * 10}s (pred)
+                        </td>
                         {step.predicted_state.map((val, vIdx) => (
-                          <td key={vIdx} className="py-1 px-2">{val.toFixed(2)}</td>
+                          <td key={vIdx} className="py-1 px-2">
+                            {val.toFixed(2)}
+                          </td>
                         ))}
                       </tr>
                     ))}
