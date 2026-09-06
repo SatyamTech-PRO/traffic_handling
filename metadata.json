@@ -1,6 +1,8 @@
 {
-  "name": "Cyber World Model",
-  "description": "Cyber World Model — forecasts attack progression 50 seconds ahead from real network traffic",
+  "name": "Remix Remix Cyber World Model State Generator",
+  "description": "Data preprocessing and state vector aggregation pipeline for cybersecurity world models using CIC-IDS2017/2018 datasets.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
 }

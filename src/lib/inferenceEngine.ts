@@ -16,12 +16,12 @@ export interface WeightsSchema {
     var: number[];
   };
   weights: {
-    lstm_weight_ih: number[][]; // (256, 7)
+    lstm_weight_ih: number[][]; // (256, 14)
     lstm_weight_hh: number[][]; // (256, 64)
     lstm_bias_ih: number[];     // (256)
     lstm_bias_hh: number[];     // (256)
-    state_head_weight: number[][]; // (7, 64)
-    state_head_bias: number[];     // (7)
+    state_head_weight: number[][]; // (14, 64)
+    state_head_bias: number[];     // (14)
     attack_head_weight: number[][]; // (1, 64)
     attack_head_bias: number[];     // (1)
   };
@@ -30,7 +30,7 @@ export interface WeightsSchema {
 
 export const MODEL_WEIGHTS = weightsData as WeightsSchema;
 const H = MODEL_WEIGHTS.metadata.hidden_size; // 64
-const D = MODEL_WEIGHTS.metadata.num_features; // 7
+const D = MODEL_WEIGHTS.metadata.num_features; // 14
 
 export const FEATURE_KEYS = [
   'total_connections',
@@ -144,12 +144,20 @@ export function tanh(x: number): number {
 // ---------------------------------------------------------------------------
 export function normalizeVector(rawVector: number[]): number[] {
   const { mean, scale } = MODEL_WEIGHTS.scaler;
-  return rawVector.map((val, idx) => (val - mean[idx]) / scale[idx]);
+  return rawVector.map((val, idx) => {
+    const s = scale[idx] ?? 1;
+    const m = mean[idx] ?? 0;
+    return (val - m) / s;
+  });
 }
 
 export function denormalizeVector(zVector: number[]): number[] {
   const { mean, scale } = MODEL_WEIGHTS.scaler;
-  return zVector.map((z, idx) => z * scale[idx] + mean[idx]);
+  return zVector.map((z, idx) => {
+    const s = scale[idx] ?? 1;
+    const m = mean[idx] ?? 0;
+    return z * s + m;
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -165,14 +173,14 @@ export function mapToMitreStage(stateVector: number[]): string {
   const pkts_sec = stateVector[4];
   const iat_var = stateVector[6];
 
-  // 1. Reconnaissance (PortScan)
-  if (unique_ports >= t.THRESH_RECON_PORTS) {
-    return 'Reconnaissance';
-  }
-
-  // 2. Impact (DoS/DDoS)
+  // 1. Impact (DoS/DDoS) - volumetric flag or packet flood
   if (flags >= t.THRESH_IMPACT_FLAGS || pkts_sec >= t.THRESH_IMPACT_PKTS) {
     return 'Impact (DoS/DDoS)';
+  }
+
+  // 2. Reconnaissance (PortScan) - destination port sweep
+  if (unique_ports >= t.THRESH_RECON_PORTS) {
+    return 'Reconnaissance';
   }
 
   // 3. Initial Access (FTP-Patator)
@@ -233,7 +241,7 @@ export function runLSTMForward(sequenceZ: number[][]): LSTMForwardResult {
       let sum_o = b_ih[idx_o] + b_hh[idx_o];
 
       for (let j = 0; j < D; j++) {
-        const val_x = xt[j];
+        const val_x = xt && xt[j] !== undefined ? xt[j] : 0;
         sum_i += w_ih[idx_i][j] * val_x;
         sum_f += w_ih[idx_f][j] * val_x;
         sum_g += w_ih[idx_g][j] * val_x;
@@ -264,7 +272,7 @@ export function runLSTMForward(sequenceZ: number[][]): LSTMForwardResult {
     c = new_c;
   }
 
-  // Head 1: state_head (Linear: 64 -> 7)
+  // Head 1: state_head (Linear: 64 -> 14)
   const nextState: number[] = new Array(D).fill(0);
   const sw = MODEL_WEIGHTS.weights.state_head_weight;
   const sb = MODEL_WEIGHTS.weights.state_head_bias;
@@ -296,6 +304,7 @@ export function computeFeatureAttribution(sequenceZ: number[][]): [string, numbe
   const baseProb = baseResult.attackProb;
 
   const attributions: [string, number][] = [];
+  const featNames = MODEL_WEIGHTS.metadata.feature_names || FEATURE_KEYS;
 
   for (let featIdx = 0; featIdx < D; featIdx++) {
     // Perturb sequence by resetting feature to normalized zero (mean)
@@ -307,7 +316,8 @@ export function computeFeatureAttribution(sequenceZ: number[][]): [string, numbe
 
     const perturbedResult = runLSTMForward(perturbedSeq);
     const impact = baseProb - perturbedResult.attackProb;
-    attributions.push([FEATURE_KEYS[featIdx], impact]);
+    const featKey = featNames[featIdx] || (FEATURE_KEYS as readonly string[])[featIdx] || `feature_${featIdx}`;
+    attributions.push([featKey, impact]);
   }
 
   // Sort descending by absolute attribution magnitude

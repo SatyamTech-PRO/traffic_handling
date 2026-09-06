@@ -9,18 +9,18 @@ import { ForecasterSimulator } from './components/ForecasterSimulator';
 
 export default function App() {
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-emerald-500/30 selection:text-emerald-200">
+    <div className="min-h-screen bg-[#FAFAF8] text-[#18181B] flex flex-col selection:bg-slate-200 selection:text-slate-900 antialiased">
       <Navbar />
 
-      <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 py-6 sm:py-8">
+      <main className="flex-1 max-w-5xl w-full mx-auto px-4 sm:px-6 py-12">
         <ForecasterSimulator />
       </main>
 
-      <footer className="border-t border-slate-800/80 py-4 text-center text-xs text-slate-500">
-        <div className="max-w-5xl mx-auto px-4 flex flex-col sm:flex-row items-center justify-between gap-2">
-          <span>Cyber World Model • Autoregressive Threat Dynamics</span>
-          <span className="font-mono text-[11px] text-slate-500">
-            Real inference on held-out network sessions
+      <footer className="border-t border-[#EAEAE5] py-8 text-xs text-[#71717A]">
+        <div className="max-w-5xl mx-auto px-4 sm:px-6 flex flex-col sm:flex-row items-center justify-between gap-4">
+          <span className="font-medium text-[#52525B]">Cyber World Model &bull; Autoregressive Threat Dynamics</span>
+          <span className="font-mono text-[11px] text-[#A1A1AA]">
+            Held-out network session evaluation &bull; 10s state resolution
           </span>
         </div>
       </footer>

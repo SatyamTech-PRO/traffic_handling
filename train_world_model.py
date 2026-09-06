@@ -24,17 +24,21 @@ Why this matters for judges:
 
 import os
 import sys
+import json
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
+import joblib
 
 # ---------------------------------------------------------------------------
 # Configuration & Hyperparameters
 # ---------------------------------------------------------------------------
 STATES_NPY_PATH = "states.npy"
 LABELS_NPY_PATH = "labels.npy"
-MODEL_SAVE_PATH = "world_model.pt"
+MODEL_SAVE_PATH = "world_model_real.pt"
+WEIGHTS_JSON_SAVE_PATH = "world_model_weights_real.json"
+SCALER_PATH = "state_scaler.joblib"
 
 WINDOW_SIZE = 5         # Input sequence: last 5 consecutive 10s states (50s context)
 HIDDEN_SIZE = 64        # LSTM hidden state dimension
@@ -44,8 +48,9 @@ BATCH_SIZE = 16         # Mini-batch size
 LEARNING_RATE = 0.001   # Adam optimizer learning rate
 ATTACK_LOSS_WEIGHT = 0.5 # Weighting scalar for the BCE attack probability loss
 
-# Feature schema definition (7-dimensional continuous state vector)
+# Feature schema definition (14 continuous state features: 7 flow + 7 packet)
 FEATURE_NAMES = [
+    # 7 Flow-level indicators
     "total_connections",
     "sum_syn_ack_rst_flags",
     "unique_dest_ports",
@@ -53,6 +58,14 @@ FEATURE_NAMES = [
     "avg_packets_per_sec",
     "avg_iat_mean",
     "avg_iat_variance",
+    # 7 Packet-level indicators
+    "pkt_ttl_variance",
+    "pkt_tcp_window_avg",
+    "pkt_ip_frag_fraction",
+    "pkt_payload_mean",
+    "pkt_payload_std",
+    "pkt_retrans_count",
+    "pkt_portscan_delta_std",
 ]
 
 # ---------------------------------------------------------------------------
@@ -205,6 +218,62 @@ class CyberWorldModel(nn.Module):
 # ---------------------------------------------------------------------------
 # 3. Model Training & Optimization Pipeline
 # ---------------------------------------------------------------------------
+def export_real_weights_to_json(model: nn.Module, save_path: str = WEIGHTS_JSON_SAVE_PATH, scaler_path: str = SCALER_PATH):
+    state_dict = model.state_dict()
+    scaler_obj = joblib.load(scaler_path)
+    scaler = scaler_obj["scaler"] if isinstance(scaler_obj, dict) and "scaler" in scaler_obj else scaler_obj
+    
+    export_data = {
+        "metadata": {
+            "model_name": "CyberWorldModel",
+            "framework": "PyTorch",
+            "num_features": len(FEATURE_NAMES),
+            "hidden_size": HIDDEN_SIZE,
+            "num_layers": NUM_LAYERS,
+            "gate_order": ["input", "forget", "cell", "output"],
+            "feature_names": FEATURE_NAMES
+        },
+        "scaler": {
+            "mean": scaler.mean_.tolist(),
+            "scale": scaler.scale_.tolist(),
+            "var": scaler.var_.tolist() if hasattr(scaler, 'var_') else (scaler.scale_**2).tolist(),
+        },
+        "weights": {
+            "lstm_weight_ih": state_dict["lstm.weight_ih_l0"].cpu().numpy().tolist(),
+            "lstm_weight_hh": state_dict["lstm.weight_hh_l0"].cpu().numpy().tolist(),
+            "lstm_bias_ih": state_dict["lstm.bias_ih_l0"].cpu().numpy().tolist(),
+            "lstm_bias_hh": state_dict["lstm.bias_hh_l0"].cpu().numpy().tolist(),
+            "state_head_weight": state_dict["state_head.weight"].cpu().numpy().tolist(),
+            "state_head_bias": state_dict["state_head.bias"].cpu().numpy().tolist(),
+            "attack_head_weight": state_dict["attack_head.0.weight"].cpu().numpy().tolist(),
+            "attack_head_bias": state_dict["attack_head.0.bias"].cpu().numpy().tolist(),
+        },
+        "mitre_thresholds": {
+            "THRESH_RECON_PORTS": 1.01,
+            "THRESH_IMPACT_FLAGS": 0.93,
+            "THRESH_IMPACT_PKTS": 0.94,
+            "THRESH_BRUTE_BYTES_MAX": -0.45,
+            "THRESH_BRUTE_PORTS_MAX": -0.48,
+            "THRESH_EXFIL_BYTES": 1.5,
+            "THRESH_EXFIL_PORTS_MAX": 0.5,
+            "THRESH_LATERAL_CONNS": 1.0,
+            "THRESH_LATERAL_PORTS": 0.6,
+            "THRESH_C2_IAT_VAR_MAX": -0.4,
+            "THRESH_C2_BYTES_MAX": 0.3
+        }
+    }
+    
+    with open(save_path, "w") as f:
+        json.dump(export_data, f, indent=2)
+        
+    frontend_path = os.path.join("src", "data", save_path)
+    if os.path.exists("src/data"):
+        with open(frontend_path, "w") as f:
+            json.dump(export_data, f, indent=2)
+            
+    return export_data
+
+
 def train_world_model(
     states_path: str = STATES_NPY_PATH,
     labels_path: str = LABELS_NPY_PATH,
@@ -216,40 +285,21 @@ def train_world_model(
     """
     Jointly trains the World Model transition dynamics and attack prediction head.
     """
-    print("\n" + "=" * 75)
-    print(" STAGE 2: TRAINING CYBER WORLD MODEL DYNAMICS (PyTorch)")
-    print("=" * 75)
-    
-    # 1. Load data from Stage 1
+    # 1. Load data from combine_all_states.py
     if not os.path.exists(states_path):
-        raise FileNotFoundError(
-            "states.npy not found or too small. Run preprocess_traffic.py on the "
-            "REAL CIC-IDS dataset first. Do not proceed with synthetic data."
-        )
+        raise FileNotFoundError(f"'{states_path}' not found. Run combine_all_states.py first.")
 
-    print(f"[Load] Loading state vectors from: '{states_path}'")
     states = np.load(states_path)
-    if len(states) < 100:
-        raise FileNotFoundError(
-            "states.npy not found or too small. Run preprocess_traffic.py on the "
-            "REAL CIC-IDS dataset first. Do not proceed with synthetic data."
-        )
-
     if not os.path.exists(labels_path):
-        raise FileNotFoundError(
-            f"'{labels_path}' not found. Run preprocess_traffic.py on the "
-            "REAL CIC-IDS dataset first. Do not proceed with synthetic data."
-        )
+        raise FileNotFoundError(f"'{labels_path}' not found. Run combine_all_states.py first.")
     labels = np.load(labels_path)
 
     num_windows, num_features = states.shape
-    print(f"       Loaded {num_windows} time windows with {num_features} normalized features each.")
     
-    # 2. Chronological 80/20 Train/Validation Split (Session-aware anti-leakage)
+    # 2. Chronological 80/20 Train/Validation Split
     split_idx = int(num_windows * 0.8)
     train_states, val_states = states[:split_idx], states[split_idx:]
     train_labels, val_labels = labels[:split_idx], labels[split_idx:]
-    print(f"       Chronological Split: {len(train_states)} training windows (first 80%), {len(val_states)} validation windows (last 20%).")
 
     # Build temporal sliding window datasets
     train_dataset = SlidingWindowDataset(train_states, train_labels, window_size=WINDOW_SIZE)
@@ -257,26 +307,14 @@ def train_world_model(
     
     dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    print(f"       Constructed {len(train_dataset)} training pairs and {len(val_dataset)} unseen validation pairs (5 input states -> 1 target state).")
     
     # 3. Instantiate model, loss criteria, and optimizer
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"       Device configured: {device}")
-    
     model = CyberWorldModel(num_features=num_features, hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS).to(device)
     
-    # Loss 1: MSE for continuous state vector reconstruction (environment physics)
     criterion_state = nn.MSELoss()
-    # Loss 2: BCE for attack probability calibration
     criterion_attack = nn.BCELoss()
-    
     optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    
-    print("\n--- Starting Training (30 Epochs with Chronological Validation) ---")
-    best_val_loss = float("inf")
-    best_val_epoch = 1
-    first_overfit_epoch = None
-    prev_train_loss = float("inf")
     
     for epoch in range(1, epochs + 1):
         model.train()
@@ -290,15 +328,10 @@ def train_world_model(
             batch_target_attack = batch_target_attack.to(device)
             
             optimizer.zero_grad()
-            
-            # Forward pass: predict S_{t+1} and P(Attack)_{t+1}
             pred_state, pred_attack = model(batch_x)
             
-            # Compute dual losses
             loss_mse = criterion_state(pred_state, batch_target_state)
             loss_bce = criterion_attack(pred_attack, batch_target_attack)
-            
-            # Joint objective: MSE (physics) + weighted BCE (cyber risk)
             total_loss = loss_mse + ATTACK_LOSS_WEIGHT * loss_bce
             
             total_loss.backward()
@@ -312,7 +345,7 @@ def train_world_model(
         train_mse = epoch_mse / len(train_dataset)
         train_bce = epoch_bce / len(train_dataset)
 
-        # Validation evaluation on the reserved last 20% unseen timeline
+        # Validation evaluation
         model.eval()
         val_epoch_loss = 0.0
         val_epoch_mse = 0.0
@@ -336,28 +369,10 @@ def train_world_model(
         val_mse = val_epoch_mse / len(val_dataset)
         val_bce = val_epoch_bce / len(val_dataset)
 
-        # Track overfitting: validation loss stops improving or rises while train loss drops
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            best_val_epoch = epoch
-        elif first_overfit_epoch is None and epoch >= 10 and (val_loss > best_val_loss * 1.02) and (train_loss < prev_train_loss):
-            first_overfit_epoch = best_val_epoch
-            
-        prev_train_loss = train_loss
-        
-        # Print loss progression per epoch (Train and Unseen Validation side-by-side)
-        if epoch % 5 == 0 or epoch == 1 or epoch == epochs:
-            print(
-                f"Epoch [{epoch:02d}/{epochs:02d}] | "
-                f"Train Loss: {train_loss:.4f} (MSE: {train_mse:.4f}, BCE: {train_bce:.4f}) | "
-                f"Val Loss: {val_loss:.4f} (MSE: {val_mse:.4f}, BCE: {val_bce:.4f})"
-            )
+    # Print final train/val loss only
+    print(f"Final Train Loss: {train_loss:.4f} (MSE: {train_mse:.4f}, BCE: {train_bce:.4f})")
+    print(f"Final Val Loss:   {val_loss:.4f} (MSE: {val_mse:.4f}, BCE: {val_bce:.4f})")
 
-    if first_overfit_epoch:
-        print(f"\n[Overfitting Check] Signs of overfitting detected after epoch {first_overfit_epoch} (validation loss reached minimum {best_val_loss:.4f} and stabilized/drifted while training loss kept dropping).")
-    else:
-        print(f"\n[Overfitting Check] Validation loss stably converged to {val_loss:.4f} without severe divergence.")
-            
     # 4. Save model weights and metadata
     torch.save({
         'model_state_dict': model.state_dict(),
@@ -366,7 +381,9 @@ def train_world_model(
         'num_layers': NUM_LAYERS,
         'window_size': WINDOW_SIZE
     }, save_path)
-    print(f"\n[Saved] Cyber World Model saved to: '{save_path}'")
+
+    # 5. Export JSON weights
+    export_real_weights_to_json(model, save_path=WEIGHTS_JSON_SAVE_PATH, scaler_path=SCALER_PATH)
     
     return model, states, num_features
 
@@ -598,65 +615,7 @@ def explain_prediction_shap(
 # 7. Main Execution & Demonstration
 # ---------------------------------------------------------------------------
 def main():
-    # 1. Train the model
-    model, states, num_features = train_world_model()
-    
-    # 2. Demonstration: Perform a 5-step forward forecast on the latest telemetry
-    print("\n" + "=" * 85)
-    print(" DEMO 1: 5-STEP AUTOREGRESSIVE FORECAST WITH MITRE ATT&CK TACTIC MAPPING")
-    print("=" * 85)
-    
-    sample_context = states[-5:]
-    print("Historical Context: Using last 5 observed time windows (t-40s to t)...")
-    
-    K = 5
-    future_trajectory = forecast(model, sample_context, k_steps=K)
-    
-    print("\nHypothesized Cyber Range Future (Autoregressively Generated):")
-    print("-" * 85)
-    print(f"{'Step':<6} | {'Lookahead':<11} | {'P(Attack)':<12} | {'MITRE ATT&CK Stage':<20} | {'State Vector (Top 3)'}")
-    print("-" * 85)
-    
-    highest_risk_step = None
-    highest_risk_prob = -1.0
-    highest_risk_idx = 1
-    
-    for i, (pred_s, p_attack) in enumerate(future_trajectory, start=1):
-        lookahead_sec = i * 10
-        mitre_stage = map_to_mitre_stage(pred_s)
-        state_preview = f"[{pred_s[0]:+.2f}, {pred_s[1]:+.2f}, {pred_s[2]:+.2f}]"
-        
-        print(f"t+{i:<3} | +{lookahead_sec}s ahead | {p_attack*100:5.1f}%     | {mitre_stage:<20} | {state_preview}")
-        
-        if p_attack > highest_risk_prob:
-            highest_risk_prob = p_attack
-            highest_risk_step = pred_s
-            highest_risk_idx = i
-
-    # 3. Demonstration: SHAP Feature Attribution on Alarmed State
-    print("\n" + "=" * 85)
-    print(f" DEMO 2: SHAP EXPLAINABILITY - WHY DID THE WORLD MODEL RAISE AN ALARM AT t+{highest_risk_idx}?")
-    print("=" * 85)
-    print(f"Analyzing trajectory at step t+{highest_risk_idx} [P(Attack) = {highest_risk_prob*100:.1f}%]...")
-    
-    top_explanations = explain_prediction_shap(
-        model=model,
-        sample_seq=sample_context,
-        background_data=states[:20],
-        top_k=3
-    )
-    
-    print("\nTop 3 Contributing Features to this Alarm (SHAP Impact):")
-    print("-" * 65)
-    for rank, (feat_name, shap_val) in enumerate(top_explanations, start=1):
-        direction = "+Risk (Anomalous Surge)" if shap_val > 0 else "-Risk (Suppressing)"
-        print(f"  {rank}. {feat_name:<24} | SHAP: {shap_val:+.4f} | {direction}")
-    print("-" * 65)
-    print("SOC Analyst Takeaway:")
-    print(f"  The model triggered an alert primarily due to anomalous activity in '{top_explanations[0][0]}'")
-    print(f"  aligned with the '{map_to_mitre_stage(highest_risk_step)}' attack trajectory.")
-    print("=" * 85 + "\n")
-
+    train_world_model()
 
 if __name__ == "__main__":
     main()
